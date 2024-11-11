@@ -14,30 +14,30 @@ from torch import nn
 import numpy as np
 
 
-class BasicModel(nn.Module):    
+class BasicModel(nn.Module):
     def __init__(self):
         super(BasicModel, self).__init__()
-    
+
     def getUsersRating(self, users):
         raise NotImplementedError
-    
+
 class PairWiseModel(BasicModel):
     def __init__(self):
         super(PairWiseModel, self).__init__()
     def bpr_loss(self, users, pos, neg):
         """
         Parameters:
-            users: users list 
+            users: users list
             pos: positive items for corresponding users
             neg: negative items for corresponding users
         Return:
             (log-loss, l2-loss)
         """
         raise NotImplementedError
-    
+
 class PureMF(BasicModel):
-    def __init__(self, 
-                 config:dict, 
+    def __init__(self,
+                 config:dict,
                  dataset:BasicDataset):
         super(PureMF, self).__init__()
         self.num_users  = dataset.n_users
@@ -45,21 +45,21 @@ class PureMF(BasicModel):
         self.latent_dim = config['latent_dim_rec']
         self.f = nn.Sigmoid()
         self.__init_weight()
-        
+
     def __init_weight(self):
         self.embedding_user = torch.nn.Embedding(
             num_embeddings=self.num_users, embedding_dim=self.latent_dim)
         self.embedding_item = torch.nn.Embedding(
             num_embeddings=self.num_items, embedding_dim=self.latent_dim)
         print("using Normal distribution N(0,1) initialization for PureMF")
-        
+
     def getUsersRating(self, users):
         users = users.long()
         users_emb = self.embedding_user(users)
         items_emb = self.embedding_item.weight
         scores = torch.matmul(users_emb, items_emb.t())
         return self.f(scores)
-    
+
     def bpr_loss(self, users, pos, neg):
         users_emb = self.embedding_user(users.long())
         pos_emb   = self.embedding_item(pos.long())
@@ -67,22 +67,32 @@ class PureMF(BasicModel):
         pos_scores= torch.sum(users_emb*pos_emb, dim=1)
         neg_scores= torch.sum(users_emb*neg_emb, dim=1)
         loss = torch.mean(nn.functional.softplus(neg_scores - pos_scores))
-        reg_loss = (1/2)*(users_emb.norm(2).pow(2) + 
-                          pos_emb.norm(2).pow(2) + 
+        reg_loss = (1/2)*(users_emb.norm(2).pow(2) +
+                          pos_emb.norm(2).pow(2) +
                           neg_emb.norm(2).pow(2))/float(len(users))
         return loss, reg_loss
-        
+
     def forward(self, users, items):
         users = users.long()
         items = items.long()
         users_emb = self.embedding_user(users)
         items_emb = self.embedding_item(items)
         scores = torch.sum(users_emb*items_emb, dim=1)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(input_edge_nf + edges_in_nf, hidden_nf, bias=bias),
+            act_fn,
+            nn.Linear(hidden_nf, hidden_nf, bias=bias),
+            act_fn)
+        self.att_mlp = nn.Sequential(
+            nn.Linear(input_nf, hidden_nf, bias=bias),
+            act_fn,
+            nn.Linear(hidden_nf, 1, bias=bias),
+            nn.Sigmoid())
         return self.f(scores)
 
 class LightGCN(BasicModel):
-    def __init__(self, 
-                 config:dict, 
+    def __init__(self,
+                 config:dict,
                  dataset:BasicDataset):
         super(LightGCN, self).__init__()
         self.config = config
@@ -127,7 +137,7 @@ class LightGCN(BasicModel):
         values = values[random_index]/keep_prob
         g = torch.sparse.FloatTensor(index.t(), values, size)
         return g
-    
+
     def __dropout(self, keep_prob):
         if self.A_split:
             graph = []
@@ -136,11 +146,11 @@ class LightGCN(BasicModel):
         else:
             graph = self.__dropout_x(self.Graph, keep_prob)
         return graph
-    
+
     def computer(self):
         """
         propagate methods for lightGCN
-        """       
+        """
         users_emb = self.embedding_user.weight
         items_emb = self.embedding_item.weight
         all_emb = torch.cat([users_emb, items_emb])
@@ -151,10 +161,10 @@ class LightGCN(BasicModel):
                 print("droping")
                 g_droped = self.__dropout(self.keep_prob)
             else:
-                g_droped = self.Graph        
+                g_droped = self.Graph
         else:
-            g_droped = self.Graph    
-        
+            g_droped = self.Graph
+
         for layer in range(self.n_layers):
             if self.A_split:
                 temp_emb = []
@@ -164,20 +174,26 @@ class LightGCN(BasicModel):
                 all_emb = side_emb
             else:
                 all_emb = torch.sparse.mm(g_droped, all_emb)
+
+                radial, coord_diff = self.coord2radial(edge_index, coord)
+                edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+                self.coord = self.coord_model(self.coord, edge_index, coord_diff, edge_feat)
+                h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+
             embs.append(all_emb)
         embs = torch.stack(embs, dim=1)
         #print(embs.size())
         light_out = torch.mean(embs, dim=1)
         users, items = torch.split(light_out, [self.num_users, self.num_items])
         return users, items
-    
+
     def getUsersRating(self, users):
         all_users, all_items = self.computer()
         users_emb = all_users[users.long()]
         items_emb = all_items
         rating = self.f(torch.matmul(users_emb, items_emb.t()))
         return rating
-    
+
     def getEmbedding(self, users, pos_items, neg_items):
         all_users, all_items = self.computer()
         users_emb = all_users[users]
@@ -187,22 +203,65 @@ class LightGCN(BasicModel):
         pos_emb_ego = self.embedding_item(pos_items)
         neg_emb_ego = self.embedding_item(neg_items)
         return users_emb, pos_emb, neg_emb, users_emb_ego, pos_emb_ego, neg_emb_ego
-    
+
     def bpr_loss(self, users, pos, neg):
-        (users_emb, pos_emb, neg_emb, 
+        (users_emb, pos_emb, neg_emb,
         userEmb0,  posEmb0, negEmb0) = self.getEmbedding(users.long(), pos.long(), neg.long())
-        reg_loss = (1/2)*(userEmb0.norm(2).pow(2) + 
+        reg_loss = (1/2)*(userEmb0.norm(2).pow(2) +
                          posEmb0.norm(2).pow(2)  +
                          negEmb0.norm(2).pow(2))/float(len(users))
         pos_scores = torch.mul(users_emb, pos_emb)
         pos_scores = torch.sum(pos_scores, dim=1)
         neg_scores = torch.mul(users_emb, neg_emb)
         neg_scores = torch.sum(neg_scores, dim=1)
-        
+
         loss = torch.mean(torch.nn.functional.softplus(neg_scores - pos_scores))
-        
+
         return loss, reg_loss
-       
+
+    def edge_model(self, source, target, radial, edge_attr):
+        if edge_attr is None:  # Unused.
+            out = torch.cat([source, target, radial], dim=1)
+        else:
+            out = torch.cat([source, target, radial, edge_attr], dim=1)
+        out = self.edge_mlp(out)
+        if self.attention:
+            att_val = self.att_mlp(out)
+            out = out * att_val
+        return out
+
+    def node_model(self, x, edge_index, edge_attr, node_attr):
+        row, col = edge_index
+        agg = unsorted_segment_sum(edge_attr, row, num_segments=x.size(0))
+        if node_attr is not None:
+            agg = torch.cat([x, agg, node_attr], dim=1)
+        else:
+            agg = torch.cat([x, agg], dim=1)
+        out = self.node_mlp(agg)
+        if self.recurrent:
+            out = x + out
+        return out, agg
+
+    def coord_model(self, coord, edge_index, coord_diff, edge_feat):
+        row, col = edge_index
+        trans = coord_diff * self.coord_mlp(edge_feat)
+        trans = torch.clamp(trans, min=-100, max=100) #This is never activated but just in case it case it explosed it may save the train
+        agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))
+        coord += agg*self.coords_weight
+        return coord
+
+
+    def coord2radial(self, edge_index, coord):
+        row, col = edge_index
+        coord_diff = coord[row] - coord[col]
+        radial = torch.sum((coord_diff)**2, 1).unsqueeze(1)
+
+        if self.norm_diff:
+            norm = torch.sqrt(radial) + 1
+            coord_diff = coord_diff/(norm)
+
+        return radial, coord_diff
+
     def forward(self, users, items):
         # compute embedding
         all_users, all_items = self.computer()
