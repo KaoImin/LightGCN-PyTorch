@@ -97,7 +97,61 @@ class LightGCN(BasicModel):
         super(LightGCN, self).__init__()
         self.config = config
         self.dataset : dataloader.BasicDataset = dataset
+        self.graph = self.dataset.getSparseGraph()
+        self.__init_edge_index()
+        self.__init_coord()
         self.__init_weight()
+
+    def __init_edge_index(self):
+        """
+        Convert an adjacency matrix to edge_index format.
+
+        Args:
+            adj_matrix (scipy.sparse.csr_matrix): Sparse adjacency matrix.
+
+        Returns:
+            edge_index (torch.LongTensor): Edge indices in the format [2, num_edges].
+        """
+        # Get the row and column indices of non-zero elements in the adjacency matrix
+        row, col = self.graph.nonzero()
+
+        # Stack the row and column indices to form the edge_index
+        self.edge_index = torch.tensor([row, col], dtype=torch.long)
+
+        return
+
+    def __init_coord(self, num_eigenvectors=3):
+        """
+        Computes the position matrix using the smallest non-zero eigenvectors
+        of the Laplacian matrix as node coordinates.
+
+        Args:
+            num_eigenvectors (int): Number of smallest non-zero eigenvectors to use as coordinates.
+
+        Returns:
+            user_positions (torch.Tensor): Coordinate matrix for users.
+            item_positions (torch.Tensor): Coordinate matrix for items.
+        """
+        # Convert PyTorch sparse tensor to SciPy sparse matrix
+        adj_matrix = self.graph.to_scipy(layout='csr')
+
+        # Compute degree matrix D and Laplacian L = D - A
+        degree_matrix = sp.diags(adj_matrix.sum(axis=1).A1, format="csr")
+        laplacian = degree_matrix - adj_matrix
+
+        # Compute the smallest non-zero eigenvectors of the Laplacian
+        eigvals, eigvecs = eigsh(laplacian, k=num_eigenvectors + 1, which="SM", sigma=1e-5)
+
+        # Skip the smallest eigenvalue (0) and get the next num_eigenvectors eigenvectors
+        eigvecs = eigvecs[:, 1:num_eigenvectors + 1]
+
+        # Split eigenvectors for users and items
+        user_positions = torch.tensor(eigvecs[:self.num_users], dtype=torch.float32)
+        item_positions = torch.tensor(eigvecs[self.num_users:], dtype=torch.float32)
+        # 拼接用户和物品的坐标矩阵
+        self.coord = torch.cat([user_positions, item_positions], dim=0)
+
+        return user_positions, item_positions
 
     def __init_weight(self):
         self.num_users  = self.dataset.n_users
@@ -175,10 +229,10 @@ class LightGCN(BasicModel):
             else:
                 all_emb = torch.sparse.mm(g_droped, all_emb)
 
-                radial, coord_diff = self.coord2radial(edge_index, coord)
+                radial, coord_diff = self.coord2radial(self.edge_index, self.coord)
                 edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
-                self.coord = self.coord_model(self.coord, edge_index, coord_diff, edge_feat)
-                h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+                self.coord = self.coord_model(self.coord, self.edge_index, coord_diff, edge_feat)
+                h, agg = self.node_model(h, self.edge_index, edge_feat, node_attr)
 
             embs.append(all_emb)
         embs = torch.stack(embs, dim=1)
